@@ -14,7 +14,7 @@ ffmpeg.setFfmpegPath('/opt/homebrew/bin/ffmpeg');
 const bot = new Bot(process.env.BOT_TOKEN);
 let transcriber;
 
-// 2. AI ENGINE: Load Whisper locally
+// 2. AI ENGINE
 async function loadAI() {
     console.log("⏳ Loading Whisper AI model locally...");
     transcriber = await pipeline('automatic-speech-recognition', 'Xenova/whisper-tiny.en');
@@ -22,21 +22,32 @@ async function loadAI() {
 }
 loadAI();
 
-// 3. STORAGE & SESSIONS
+// 3. SESSIONS
 bot.use(session({ initial: () => ({ tempTask: null, tempTime: null, tempDate: null }) }));
 
-// 4. USER REGISTRATION & CONTEXT
+// 4. USER REGISTRATION & DAILY RESET MIDDLEWARE
 bot.use(async (ctx, next) => {
     if (ctx.from) {
         const userIdStr = ctx.from.id.toString();
+        const today = new Date().toISOString().split('T')[0]; // YYYY-MM-DD
+        
         let user = db.prepare('SELECT * FROM users WHERE telegram_id = ?').get(userIdStr);
         
         if (!user) {
             console.log(`🆕 Registering: ${ctx.from.username}`);
-            db.prepare('INSERT INTO users (telegram_id, username, credits) VALUES (?, ?, ?)')
-              .run(userIdStr, ctx.from.username || 'Anonymous', 10);
+            db.prepare('INSERT INTO users (telegram_id, username, credits, last_reset) VALUES (?, ?, ?, ?)')
+              .run(userIdStr, ctx.from.username || 'Anonymous', 10, today);
             user = db.prepare('SELECT * FROM users WHERE telegram_id = ?').get(userIdStr);
         }
+
+        // Reset daily limits if it's a new day
+        if (user.last_reset !== today) {
+            db.prepare('UPDATE users SET daily_text_count = 0, daily_voice_count = 0, last_reset = ? WHERE id = ?')
+              .run(today, user.id);
+            user.daily_text_count = 0;
+            user.daily_voice_count = 0;
+        }
+        
         ctx.user = user; 
     }
     await next();
@@ -45,7 +56,7 @@ bot.use(async (ctx, next) => {
 // --- COMMANDS ---
 
 bot.command("start", (ctx) => {
-    ctx.reply(`Welcome ${ctx.from.first_name}! 🕒\n\nYou have ${ctx.user.credits} credits remaining.\n\nSend me a text or voice note like: "Remind me to call the bank tomorrow at 10am".`);
+    ctx.reply(`Welcome ${ctx.from.first_name}! 🕒\n\nDaily Free: 4 Text / 1 Voice\nYour Credits: ${ctx.user.credits}\n\nTry: "Remind me to check the oven in 5 minutes"`);
 });
 
 bot.command("dashboard", async (ctx) => {
@@ -60,27 +71,30 @@ bot.command("dashboard", async (ctx) => {
         : "No active reminders.";
 
     await ctx.reply(
-        `📊 **THANK ME LATER DASHBOARD**\n\n` +
-        `👤 **User:** ${ctx.from.username || 'Anonymous'}\n` +
-        `🪙 **Credits:** ${ctx.user.credits}\n` +
-        `⭐ **Status:** ${ctx.user.is_premium ? 'Later+ (Premium)' : 'Free Tier'}\n\n` +
+        `📊 **DASHBOARD**\n\n` +
+        `🪙 Credits: ${ctx.user.credits}\n` +
+        `📝 Daily Texts: ${ctx.user.daily_text_count}/4\n` +
+        `🎙️ Daily Voice: ${ctx.user.daily_voice_count}/1\n\n` +
         `🕒 **Active Reminders:**\n${reminderList}`,
         {
             parse_mode: "Markdown",
             reply_markup: {
                 inline_keyboard: [
-                    [{ text: "💳 Buy Credits", callback_data: "buy_credits" }],
-                    [{ text: "🗑️ Clear All Reminders", callback_data: "clear_all" }]
+                    [{ text: "💳 Buy 50 Credits (150 Stars)", callback_data: "buy_credits" }],
+                    [{ text: "🗑️ Clear All", callback_data: "clear_all" }]
                 ]
             }
         }
     );
 });
 
-// --- HANDLERS ---
+// --- MESSAGE HANDLERS ---
 
 bot.on("message:text", async (ctx) => {
-    if (ctx.user.credits <= 0) return ctx.reply("🪫 Out of credits! Use /dashboard to upgrade.");
+    // Allowance Check
+    if (ctx.user.daily_text_count >= 4 && ctx.user.credits <= 0) {
+        return ctx.reply("🪫 Daily free limit reached! Use /dashboard to get more credits.");
+    }
 
     const analysis = parseReminder(ctx.message.text);
     ctx.session.tempTask = analysis.task;
@@ -91,7 +105,7 @@ bot.on("message:text", async (ctx) => {
         parse_mode: "Markdown",
         reply_markup: {
             inline_keyboard: [[
-                { text: "✅ Log It", callback_data: "confirm" },
+                { text: "✅ Log It", callback_data: "confirm_text" },
                 { text: "❌ Cancel", callback_data: "cancel" }
             ]]
         }
@@ -99,7 +113,10 @@ bot.on("message:text", async (ctx) => {
 });
 
 bot.on("message:voice", async (ctx) => {
-    if (ctx.user.credits <= 0) return ctx.reply("⚠️ Out of credits! Upgrade for unlimited voice reminders.");
+    // Allowance Check
+    if (ctx.user.daily_voice_count >= 1 && ctx.user.credits <= 0) {
+        return ctx.reply("🎙️ Daily voice limit reached! Use text or upgrade at the /dashboard.");
+    }
 
     const msg = await ctx.reply("🎙️ Thinking... (Processing locally)");
     
@@ -108,125 +125,125 @@ bot.on("message:voice", async (ctx) => {
         const url = `https://api.telegram.org/file/bot${process.env.BOT_TOKEN}/${file.file_path}`;
         const outputPath = `./voice-temp/${ctx.from.id}.wav`;
 
-        ffmpeg(url)
-            .toFormat('wav')
-            .audioChannels(1)
-            .audioFrequency(16000)
-            .on('end', async () => {
-                const buffer = fs.readFileSync(outputPath);
-                const wav = new WaveFile(buffer);
-                wav.toBitDepth('32f'); 
-                const audioData = wav.getSamples();
-                
-                const output = await transcriber(audioData);
-                const transcript = output.text;
-                
-                const analysis = parseReminder(transcript);
-                ctx.session.tempTask = analysis.task;
-                ctx.session.tempTime = analysis.timeString;
-                ctx.session.tempDate = analysis.isoDate;
+        ffmpeg(url).toFormat('wav').audioChannels(1).audioFrequency(16000).on('end', async () => {
+            const buffer = fs.readFileSync(outputPath);
+            const wav = new WaveFile(buffer);
+            wav.toBitDepth('32f'); 
+            const audioData = wav.getSamples();
+            
+            const output = await transcriber(audioData);
+            const transcript = output.text;
+            
+            const analysis = parseReminder(transcript);
+            ctx.session.tempTask = analysis.task;
+            ctx.session.tempTime = analysis.timeString;
+            ctx.session.tempDate = analysis.isoDate;
 
-                await ctx.api.editMessageText(ctx.chat.id, msg.message_id, 
-                    `I heard: "${transcript}"\n\nConfirming:\n📝 *Task:* ${analysis.task}\n⏰ *When:* ${analysis.timeString}`, {
-                    parse_mode: "Markdown",
-                    reply_markup: {
-                        inline_keyboard: [[
-                            { text: "✅ Log It", callback_data: "confirm" },
-                            { text: "❌ Cancel", callback_data: "cancel" }
-                        ]]
-                    }
-                });
-                
-                if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
-            })
-            .save(outputPath);
+            await ctx.api.editMessageText(ctx.chat.id, msg.message_id, 
+                `I heard: "${transcript}"\n\nConfirm:\n📝 *Task:* ${analysis.task}\n⏰ *When:* ${analysis.timeString}`, {
+                parse_mode: "Markdown",
+                reply_markup: {
+                    inline_keyboard: [[
+                        { text: "✅ Log It", callback_data: "confirm_voice" },
+                        { text: "❌ Cancel", callback_data: "cancel" }
+                    ]]
+                }
+            });
+            if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
+        }).save(outputPath);
     } catch (err) {
-        console.error("Voice Error:", err);
-        ctx.reply("Sorry, I couldn't process that voice note.");
+        ctx.reply("Could not process voice note.");
     }
 });
 
-// --- BUTTON CALLBACKS ---
+// --- CALLBACK QUERIES ---
 
+// --- 1. BUTTON CALLBACK HANDLER ---
 bot.on("callback_query:data", async (ctx) => {
     const data = ctx.callbackQuery.data;
 
-    if (data === "confirm") {
-        db.prepare('INSERT INTO reminders (user_id, task, remind_at, status) VALUES (?, ?, ?, ?)')
-          .run(ctx.user.id, ctx.session.tempTask, ctx.session.tempDate, 'pending');
+    // A. Handle Confirmation (Deducting Allowance/Credits)
+    if (data.startsWith("confirm")) {
+        try {
+            if (data === "confirm_voice" && ctx.user.daily_voice_count < 1) {
+                db.prepare('UPDATE users SET daily_voice_count = daily_voice_count + 1 WHERE id = ?').run(ctx.user.id);
+            } else if (data === "confirm_text" && ctx.user.daily_text_count < 4) {
+                db.prepare('UPDATE users SET daily_text_count = daily_text_count + 1 WHERE id = ?').run(ctx.user.id);
+            } else {
+                db.prepare('UPDATE users SET credits = credits - 1 WHERE id = ?').run(ctx.user.id);
+            }
 
-        db.prepare('UPDATE users SET credits = credits - 1 WHERE id = ?').run(ctx.user.id);
+            db.prepare('INSERT INTO reminders (user_id, task, remind_at, status) VALUES (?, ?, ?, ?)')
+              .run(ctx.user.id, ctx.session.tempTask, ctx.session.tempDate, 'pending');
 
-        await ctx.editMessageText(`🚀 *Log confirmed!* I'll remind you at ${ctx.session.tempTime}.\nRemaining credits: ${ctx.user.credits - 1}`);
+            await ctx.editMessageText(`🚀 *Confirmed!* I'll remind you about "${ctx.session.tempTask}" at ${ctx.session.tempTime}.`);
+        } catch (err) {
+            console.error("Confirm error:", err);
+            await ctx.reply("❌ Error saving reminder. Please try again.");
+        }
     } 
-    else if (data === "clear_all") {
-        db.prepare("UPDATE reminders SET status = 'cancelled' WHERE user_id = ? AND status = 'pending'")
-          .run(ctx.user.id);
-        await ctx.editMessageText("🗑️ All pending reminders have been cleared.");
-    } 
+    // B. Handle Invoice Trigger
     else if (data === "buy_credits") {
-        await ctx.reply("💰 Payment integration (Telegram Stars) is coming next!");
+        await ctx.replyWithInvoice(
+            "Later+ Lite (150 Credits)", 
+            "Get 150 extra voice/text reminders. No daily limits, no expiry!", 
+            "credits_150", 
+            "XTR", 
+            [{ amount: 150, label: "150 Credits" }] 
+        );
     }
-    else {
-        await ctx.editMessageText("❌ Cancelled.");
+    // C. Handle Clear All
+    else if (data === "clear_all") {
+        db.prepare("UPDATE reminders SET status = 'cancelled' WHERE user_id = ? AND status = 'pending'").run(ctx.user.id);
+        await ctx.editMessageText("🗑️ All pending reminders have been cleared.");
     }
+    // D. Handle Cancel
+    else if (data === "cancel") {
+        await ctx.editMessageText("❌ Action cancelled.");
+    }
+
     await ctx.answerCallbackQuery();
 });
 
-// --- SCHEDULER ---
+// --- 2. PAYMENT HANDLERS (MUST BE OUTSIDE BUTTON HANDLER) ---
+
+// Required: Approve pre-checkout within 10 seconds
+bot.on("pre_checkout_query", (ctx) => ctx.answerPreCheckoutQuery(true));
+
+// Handle the final success
+bot.on("message:successful_payment", async (ctx) => {
+    if (ctx.message.successful_payment.invoice_payload === "credits_150") {
+        db.prepare('UPDATE users SET credits = credits + 150 WHERE telegram_id = ?')
+          .run(ctx.from.id.toString());
+        
+        await ctx.reply("🎉 Success! 150 Credits added. Your limits are now bypassed until credits run out.");
+        console.log(`[REVENUE] User ${ctx.from.id} purchased 150 Credits.`);
+    }
+});
+// --- PAYMENTS & SCHEDULER ---
+
+bot.on("pre_checkout_query", (ctx) => ctx.answerPreCheckoutQuery(true));
+
+bot.on("message:successful_payment", async (ctx) => {
+    if (ctx.message.successful_payment.invoice_payload === "credits_50") {
+        db.prepare('UPDATE users SET credits = credits + 50 WHERE telegram_id = ?').run(ctx.from.id.toString());
+        await ctx.reply("🎉 50 credits added! Thank you for supporting the project.");
+    }
+});
 
 cron.schedule('* * * * *', async () => {
     const now = new Date().toISOString();
     const due = db.prepare(`
-        SELECT reminders.id, reminders.task, users.telegram_id 
-        FROM reminders 
+        SELECT reminders.id, reminders.task, users.telegram_id FROM reminders 
         JOIN users ON reminders.user_id = users.id 
         WHERE reminders.remind_at <= ? AND reminders.status = 'pending'
     `).all(now);
 
     for (const rem of due) {
         try {
-            await bot.api.sendMessage(rem.telegram_id, `🔔 **THANK ME LATER:**\n\nDon't forget: "${rem.task}"`);
+            await bot.api.sendMessage(rem.telegram_id, `🔔 **REMINDER:** ${rem.task}`);
             db.prepare("UPDATE reminders SET status = 'sent' WHERE id = ?").run(rem.id);
-            console.log(`[SENT] Success: ${rem.task}`);
-        } catch (err) {
-            console.error("Delivery error:", err);
-        }
-    }
-});
-
-bot.catch((err) => console.error("CRITICAL ERROR:", err));
-
-// --- PAYMENT HANDLERS (TELEGRAM STARS) ---
-
-// 1. Send the Invoice when they click "Buy Credits"
-bot.on("callback_query:data", async (ctx) => {
-    if (ctx.callbackQuery.data === "buy_credits") {
-        await ctx.replyWithInvoice(
-            "100 Thank Me Later Credits", // Title
-            "Unlock 100 high-priority AI voice transcriptions and reminders.", // Description
-            "credits_100", // Payload (Internal ID)
-            "XTR", // Currency for Telegram Stars
-            [{ amount: 100, label: "100 Credits" }] // 100 Stars
-        );
-    }
-    await ctx.answerCallbackQuery();
-});
-
-// 2. Answer the Pre-Checkout Query (Must respond within 10 seconds)
-bot.on("pre_checkout_query", (ctx) => ctx.answerPreCheckoutQuery(true));
-
-// 3. Handle Successful Payment
-bot.on("message:successful_payment", async (ctx) => {
-    const payload = ctx.message.successful_payment.invoice_payload;
-    
-    if (payload === "credits_100") {
-        // Update the database
-        db.prepare('UPDATE users SET credits = credits + 100 WHERE telegram_id = ?')
-          .run(ctx.from.id.toString());
-        
-        await ctx.reply("🎉 Payment Successful! 100 credits have been added to your account. Use /dashboard to check your balance.");
-        console.log(`[REVENUE] User ${ctx.from.id} bought 100 credits.`);
+        } catch (err) { console.error(err); }
     }
 });
 

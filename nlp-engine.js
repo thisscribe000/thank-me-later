@@ -5,36 +5,38 @@ const its = nlp.its;
 
 function parseReminder(text) {
     const doc = nlp.readDoc(text);
-    // 1. Extract potential dates and quantities (like 'two' or '2')
-    const entities = doc.entities().out(); 
-    const types = doc.entities().out(its.type);
-    
-    let dateText = "Not specified";
-    let remindAt = new Date();
-
-    // 2. Look for explicit dates or time duration keywords
     const lowerText = text.toLowerCase();
-    
-    if (lowerText.includes('minute')) {
-        // Extract the number (handle "two" or "2")
-        const match = lowerText.match(/(\d+|one|two|three|four|five|ten|fifteen|thirty)/);
+    let remindAt = new Date();
+    let dateText = "Not specified";
+
+    // 1. Handle "in X minutes" (including words like 'two')
+    const minuteMatch = lowerText.match(/(\d+|one|two|three|four|five|ten|fifteen|thirty|mins?|minutes?)/g);
+    if (lowerText.includes('min') || lowerText.includes('minute')) {
         const numMap = { one:1, two:2, three:3, four:4, five:5, ten:10, fifteen:15, thirty:30 };
-        const mins = match ? (parseInt(match[0]) || numMap[match[0]]) : 1;
-        
-        remindAt.setMinutes(remindAt.getMinutes() + mins);
-        dateText = `${mins} minutes from now`;
-    } else if (lowerText.includes('tomorrow')) {
-        remindAt.setDate(remindAt.getDate() + 1);
-        remindAt.setHours(9, 0, 0);
-        dateText = "Tomorrow at 9 AM";
+        const amount = parseInt(minuteMatch[0]) || numMap[minuteMatch[0]] || 1;
+        remindAt.setMinutes(remindAt.getMinutes() + amount);
+        dateText = `${amount} minutes from now`;
+    } 
+    // 2. Handle "at X pm" or "by X:XX"
+    else {
+        const timeMatch = lowerText.match(/(\d{1,2})(:(\d{2}))?\s*(am|pm)?/i);
+        if (timeMatch) {
+            let hours = parseInt(timeMatch[1]);
+            const minutes = timeMatch[3] ? parseInt(timeMatch[3]) : 0;
+            const ampm = timeMatch[4] ? timeMatch[4].toLowerCase() : null;
+
+            if (ampm === 'pm' && hours < 12) hours += 12;
+            if (ampm === 'am' && hours === 12) hours = 0;
+            
+            // If no AM/PM and time is 'behind' us, assume PM (e.g., it's 2pm and you say 'at 5')
+            if (!ampm && hours < remindAt.getHours()) hours += 12;
+
+            remindAt.setHours(hours, minutes, 0, 0);
+            dateText = remindAt.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+        }
     }
 
-    // 3. Clean the task name
-    let task = text.replace(/remind me to/i, '').trim();
-    if (dateText !== "Not specified") {
-        // Remove the time phrase from the task so it's just the action
-        task = task.replace(/in \d+ minutes|in two minutes|tomorrow/i, '').trim();
-    }
+    let task = text.replace(/remind me to|remind me about|at \d+.*|in \d+.*/gi, '').trim();
 
     return { 
         task: task || "Something important", 
